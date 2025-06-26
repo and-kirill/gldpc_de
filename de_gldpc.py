@@ -3,13 +3,100 @@ This module implements a quantized density evolution over a proto-graph given a 
 """
 import os
 import ctypes
-import time
+import tqdm
 
 import numpy as np
 from scipy.special import erf
 import galois
 
 GROUP = 3
+
+
+def expand(x):
+    """
+    Zero-padding to double the length.
+    To compute convolution using FFT,
+    the original PDF should be expanded twice with zero-padding.
+    """
+    return np.hstack([x, np.zeros_like(x)])
+
+
+def convolve_fft(pdf_x, pdf_y, n_points):
+    """
+    Calculate convolution using FFT
+    """
+    n_total = 2 * n_points + 1
+    assert len(pdf_x) == n_total
+    assert len(pdf_y) == n_total
+
+    pdf_z = np.real(np.fft.ifft(
+        np.fft.fft(expand(pdf_x)) * np.fft.fft(expand(pdf_y))
+    ))
+    return np.hstack([
+         np.sum(pdf_z[:(n_points + 1)]),  # The first point accumulates left tail
+         pdf_z[(n_points + 1):(n_total + n_points - 1)],
+         np.sum(pdf_z[(n_total + n_points-1):])  # The last point accumulates right tail
+    ])
+
+
+def pdf2ccdf(x, flip=False):
+    """
+    Convert probability density function into complementary CDF.
+    Return CCDF series and accumulated probability.
+    flip argument may be required when calculating the absolute value of random variable
+    """
+    if flip:
+        cdf = np.cumsum(np.flip(x))
+    else:
+        cdf = np.cumsum(x)
+    prob = cdf[-1]
+    if prob > 0:
+        return 1.0 - cdf / prob, prob
+    # Accumulated probability is zero, avoid division by zero
+    return 1.0 - cdf, 0.0
+
+
+def cdf2pdf(x, flip=False):
+    """
+    Convert CDF to PDF
+    """
+    pdf = np.hstack([[x[0]], np.diff(x)])
+    if flip:
+        return np.flip(pdf)
+    return pdf
+
+
+def minsum_abs_cdf(pdf_x, pdf_y, n_points):
+    """
+    Fast computation of min-sum rule using
+    CDF of minimum over two independent random variables
+    # https://math.stackexchange.com/questions/2757569/the-pdf-of-minimum-of-two-random-varible
+    """
+    # Positive CDFs
+    cx_pos, px_pos = pdf2ccdf(pdf_x[n_points+1:], flip=False)
+    cy_pos, py_pos = pdf2ccdf(pdf_y[n_points+1:], flip=False)
+    # Negative CDFs
+    cx_neg, px_neg = pdf2ccdf(pdf_x[:n_points], flip=True)
+    cy_neg, py_neg = pdf2ccdf(pdf_y[:n_points], flip=True)
+
+    pdf_z = np.zeros_like(pdf_x)
+    # 1. Fill the center point
+    pdf_z[n_points] = pdf_x[n_points] * pdf_y[n_points]
+    pdf_z[n_points] += pdf_x[n_points] * (1 - pdf_y[n_points])
+    pdf_z[n_points] += pdf_y[n_points] * (1 - pdf_x[n_points])
+    # 2. Add the contribution of both positive parts
+    pdf_z[n_points + 1:] +=  cdf2pdf(px_pos * py_pos * (1 - cx_pos * cy_pos))
+    # 3. Negative X and negative Y
+    pdf_z[n_points + 1:] += cdf2pdf(px_neg * py_neg * (1 - cx_neg * cy_neg))
+    # 4. Contribution of positive X and negative Y
+    pdf_z[:n_points] += cdf2pdf(px_pos * py_neg * (1 - cx_pos * cy_neg), flip=True)
+    # 5. Negative X and positive Y
+    pdf_z[:n_points] += cdf2pdf(px_neg * py_pos * (1 - cx_neg * cy_pos), flip=True)
+
+    return pdf_z
+
+
+
 
 class QuantizedPDF:
     """
@@ -41,9 +128,7 @@ class QuantizedPDF:
         :param other: PDF to be considered in min-sum rule
         :return: None, just updates internal state as self = MIN_SUM(self, other)
         """
-        pdf_out = np.zeros_like(self.pdf)
-        self.lib.minsum_abs(self.pdf, other.pdf, pdf_out, self.n_points)
-        self.pdf = pdf_out
+        self.pdf = minsum_abs_cdf(self.pdf, other.pdf, self.n_points)
 
     def convolve(self, other):
         """
@@ -51,9 +136,8 @@ class QuantizedPDF:
         :param other: PDF to be considered in convolution
         :return: None, just updates internal state as self = CONVOLVE(self, other)
         """
-        pdf_out = np.zeros_like(self.pdf)
-        self.lib.convolve_thr(self.pdf, other.pdf, pdf_out, self.n_points)
-        self.pdf = pdf_out
+        self.pdf = convolve_fft(self.pdf, other.pdf, self.n_points)
+
 
     def node_op(self, other, node_type):
         """
@@ -92,9 +176,7 @@ class QuantizedPDF:
         :param other: PDF to be considered in convolution
         :return: None, just updates internal state as self = CONVOLVE(self, other)
         """
-        pdf_out = np.zeros_like(self.pdf)
-        self.lib.gldpc_cn_op(self.pdf, other1.pdf, pdf_out, self.n_points)
-        self.pdf = pdf_out
+        self.pdf = minsum_abs_cdf(self.pdf, other1.pdf, self.n_points)
 
     def copy(self):
         """
@@ -215,8 +297,13 @@ def init_awgn_channel(lib, settings):
     x_series = np.arange(-max_llr, max_llr, 1 / scale)
     pdf = QuantizedPDF(lib, n_points)
     m_channel = 2 / sigma**2
+    # print(x_series - 1 / (2 * scale))
     cdf_values = norm_cdf(x_series - 1 / (2 * scale), m_channel, np.sqrt(2 * m_channel)) + 0.5
+    # print(settings.snr, sigma, m_channel, np.sqrt(2*m_channel))
+    # import matplotlib.pyplot as plt
     pdf.pdf = (np.append(cdf_values, 1) - np.insert(cdf_values, 0, 0))
+    # plt.plot(pdf.pdf)
+    # plt.show()
     return pdf
 
 #distribution for bsc channel
@@ -236,6 +323,7 @@ def init_channel(lib, settings):
     pdf = QuantizedPDF(lib, n_points)
     pdf.pdf[n_points - scale] = pe_channel
     pdf.pdf[n_points + scale] = 1.0 - pe_channel
+    assert False
     return pdf
 
 
@@ -245,7 +333,7 @@ def init_erasure(lib, settings):
     :param lib: QuantizedDE ctypes impl
     :return: QuantizedPDF instance
     """
-    n_points = settings.de.max_llr * settings.de.input_scale
+    n_points = settings.max_llr * settings.input_scale
     pdf = QuantizedPDF(lib, n_points)
     pdf.pdf[n_points] = 1.0
     return pdf
@@ -487,7 +575,7 @@ class QuantizedDE:
         :return: per-variable node error probabilities
         """
         self.init_distributions()
-        for i in range(self.settings.n_iterations):
+        for i in tqdm.tqdm(range(self.settings.n_iterations)):
             self.de_min_sum_iteration(self.settings.llr_scale)
         return self.output_ber()
 
@@ -544,27 +632,3 @@ def gf2_rank(mtx):
     Wrapper for matrix rank in GF2
     """
     return np.linalg.matrix_rank(galois.GF2(mtx))
-
-
-if __name__ == '__main__':
-    import json
-    from settings import Settings
-    import matplotlib.pyplot as plt
-    from simulator_awgn_python.channel import AwgnQAMChannel
-
-    lib_compile()
-
-    with open('optimization.json', 'r', encoding='utf-8') as fhandle:
-        config = json.load(fhandle)
-    de_settings = Settings('optimization.json')
-    pcm = np.loadtxt(config['exp']['init_point'], dtype=np.uint8)
-
-    print(de_settings)
-    lib = load_lib()
-    qde = QuantizedDE(lib, pcm, de_settings)
-    ber_per_vn = qde.de_min_sum()
-    print('Max BER estimate:', np.max(ber_per_vn))
-    out_pdfs = qde.output_distr()
-    for i in range(pcm.shape[1]):
-        plt.plot(out_pdfs[i, :])
-    plt.show()
